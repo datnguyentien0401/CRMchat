@@ -1,31 +1,38 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import HTTPException, status
-from sqlmodel import Session, col, select
+from sqlmodel import Session
 from uuid import UUID
 
 from app.models import (
     ApprovalStatus,
     AuditEventType,
-    AuditLog,
-    Campaign,
     Channel,
     Conversation,
-    ConversationStatus,
     Deal,
-    ExternalMessageRef,
-    KOC,
-    KOCIdentity,
     Message,
     PipelineStatus,
     RiskFlag,
     RiskSeverity,
     Role,
     User,
-    WebhookRawEvent,
     now_utc,
 )
-
+from app.repository import (
+    AuditLogRepository,
+    CampaignRepository,
+    ConversationRepository,
+    DealRepository,
+    ExternalMessageRefRepository,
+    KOCIdentityRepository,
+    KOCRepository,
+    MessageRepository,
+    RiskFlagRepository,
+    UserRepository,
+    WebhookRawEventRepository,
+)
 
 def ensure_conversation_access(*, user: User, conv: Conversation) -> None:
     if user.role == Role.booker:
@@ -47,14 +54,20 @@ def create_conversation(
     campaign_id: UUID,
     assigned_booker_id: str,
 ) -> Conversation:
-    koc = session.get(KOC, koc_id)
+    koc_repo = KOCRepository(session)
+    campaign_repo = CampaignRepository(session)
+    user_repo = UserRepository(session)
+    conv_repo = ConversationRepository(session)
+
+    koc = koc_repo.get_by_id(koc_id)
     if not koc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="KOC not found")
-    campaign = session.get(Campaign, campaign_id)
+
+    campaign = campaign_repo.get_by_id(campaign_id)
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
 
-    assigned = session.get(User, assigned_booker_id)
+    assigned = user_repo.get_by_id(assigned_booker_id)
     if not assigned or assigned.role != Role.booker:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid assigned_booker_id")
 
@@ -64,42 +77,66 @@ def create_conversation(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Assigned booker not in team")
 
     # MVP rule: conversations always belong to a team, derived from assigned booker.
-    conv = Conversation(
+    return conv_repo.create(
         koc_id=koc_id,
         campaign_id=campaign_id,
         assigned_booker_id=assigned_booker_id,
         team_id=assigned.team_id,
-        status=ConversationStatus.open,
     )
-    session.add(conv)
-    session.commit()
-    session.refresh(conv)
-    return conv
 
 
-def list_conversations_for_user(*, session: Session, user: User, booker_id: str | None) -> list[Conversation]:
-    stmt = select(Conversation)
+def list_conversations_for_user(
+    *, session: Session, user: User, booker_id: str | None
+) -> list[Conversation]:
+    conv_repo = ConversationRepository(session)
+
     if user.role == Role.booker:
-        stmt = stmt.where(Conversation.assigned_booker_id == user.id)
-    elif user.role == Role.manager:
-        stmt = stmt.where(Conversation.team_id == user.team_id)
-        if booker_id:
-            stmt = stmt.where(Conversation.assigned_booker_id == booker_id)
-    else:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        return conv_repo.list_for_booker(user.id)
+    if user.role == Role.manager:
+        return conv_repo.list_for_manager(user.team_id, booker_id=booker_id)
 
-    stmt = stmt.order_by(col(Conversation.created_at).desc())
-    return list(session.exec(stmt).all())
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
+
+def update_conversation_status(
+    *,
+    session: Session,
+    actor: User,
+    conversation_id: UUID,
+    status_value,
+) -> Conversation:
+    conv_repo = ConversationRepository(session)
+    audit_repo = AuditLogRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    ensure_conversation_access(user=actor, conv=conv)
+
+    try:
+        old = conv.status
+        conv.status = status_value
+        audit_repo.create(
+            actor_user_id=actor.id,
+            conversation_id=conversation_id,
+            event_type=AuditEventType.conversation_status_changed,
+            payload={"from": old, "to": status_value},
+        )
+        return conv_repo.save(conv)
+    except Exception:
+        session.rollback()
+        raise
 
 def list_messages(*, session: Session, user: User, conversation_id: UUID) -> list[Message]:
-    conv = session.get(Conversation, conversation_id)
+    conv_repo = ConversationRepository(session)
+    msg_repo = MessageRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     ensure_conversation_access(user=user, conv=conv)
 
-    stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(col(Message.created_at).asc())
-    return list(session.exec(stmt).all())
+    return msg_repo.list_by_conversation(conversation_id)
 
 
 def add_message(
@@ -111,7 +148,12 @@ def add_message(
     attach_to_koc_id: UUID | None,
     attach_to_campaign_id: UUID | None,
 ) -> Message:
-    conv = session.get(Conversation, conversation_id)
+    conv_repo = ConversationRepository(session)
+    msg_repo = MessageRepository(session)
+    audit_repo = AuditLogRepository(session)
+    risk_repo = RiskFlagRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     ensure_conversation_access(user=actor, conv=conv)
@@ -126,34 +168,32 @@ def add_message(
 
     # Atomic write: message + audit + (optional) risk flag
     try:
-        msg = Message(conversation_id=conversation_id, sender_user_id=actor.id, body=body)
-        session.add(msg)
-        session.flush()
+        msg = msg_repo.create_with_flush(
+            conversation_id=conversation_id,
+            sender_user_id=actor.id,
+            body=body,
+        )
 
-        session.add(
-            AuditLog(
-                actor_user_id=actor.id,
-                conversation_id=conversation_id,
-                event_type=AuditEventType.message_added,
-                payload={
-                    "message_id": str(msg.id),
-                    "koc_id": str(conv.koc_id),
-                    "campaign_id": str(conv.campaign_id),
-                },
-            )
+        audit_repo.create(
+            actor_user_id=actor.id,
+            conversation_id=conversation_id,
+            event_type=AuditEventType.message_added,
+            payload={
+                "message_id": str(msg.id),
+                "koc_id": str(conv.koc_id),
+                "campaign_id": str(conv.campaign_id),
+            },
         )
 
         kws = _contains_any(body, MONEY_KEYWORDS)
         if kws:
-            session.add(
-                RiskFlag(
-                    conversation_id=conversation_id,
-                    message_id=msg.id,
-                    risk_type="sensitive_keyword",
-                    severity=RiskSeverity.high,
-                    reason=f"Sensitive money keyword(s): {', '.join(sorted(set(kws)))}",
-                    payload={"keywords": sorted(set(kws)), "source": "internal_message"},
-                )
+            risk_repo.create(
+                conversation_id=conversation_id,
+                message_id=msg.id,
+                risk_type="sensitive_keyword",
+                severity=RiskSeverity.high,
+                reason=f"Sensitive money keyword(s): {', '.join(sorted(set(kws)))}",
+                payload={"keywords": sorted(set(kws)), "source": "internal_message"},
             )
 
         session.commit()
@@ -163,54 +203,27 @@ def add_message(
         session.rollback()
         raise
 
+def list_audits(*, session: Session, user: User, conversation_id: UUID):
+    conv_repo = ConversationRepository(session)
+    audit_repo = AuditLogRepository(session)
 
-def update_conversation_status(
-    *,
-    session: Session,
-    actor: User,
-    conversation_id: UUID,
-    status_value: ConversationStatus,
-) -> Conversation:
-    conv = session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    ensure_conversation_access(user=actor, conv=conv)
-
-    try:
-        old = conv.status
-        conv.status = status_value
-        session.add(conv)
-
-        session.add(
-            AuditLog(
-                actor_user_id=actor.id,
-                conversation_id=conversation_id,
-                event_type=AuditEventType.conversation_status_changed,
-                payload={"from": old, "to": status_value},
-            )
-        )
-
-        session.commit()
-        session.refresh(conv)
-        return conv
-    except Exception:
-        session.rollback()
-        raise
-
-
-def list_audits(*, session: Session, user: User, conversation_id: UUID) -> list[AuditLog]:
-    conv = session.get(Conversation, conversation_id)
+    conv = conv_repo.get_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     ensure_conversation_access(user=user, conv=conv)
 
-    stmt = (
-        select(AuditLog)
-        .where(AuditLog.conversation_id == conversation_id)
-        .order_by(col(AuditLog.created_at).asc())
-    )
-    return list(session.exec(stmt).all())
+    return audit_repo.list_by_conversation(conversation_id)
 
+def list_risk_flags(*, session: Session, user: User, conversation_id: UUID) -> list[RiskFlag]:
+    conv_repo = ConversationRepository(session)
+    risk_repo = RiskFlagRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    ensure_conversation_access(user=user, conv=conv)
+
+    return risk_repo.list_by_conversation(conversation_id)
 
 SENSITIVE_KEYWORDS = [
     "commission riêng",
@@ -234,36 +247,37 @@ def ingest_webhook_message(
 
     Always stores raw event. Returns dict for API response.
     """
+    raw_repo = WebhookRawEventRepository(session)
+    ext_ref_repo = ExternalMessageRefRepository(session)
+    koc_repo = KOCRepository(session)
+    koc_identity_repo = KOCIdentityRepository(session)
+    campaign_repo = CampaignRepository(session)
+    user_repo = UserRepository(session)
+    conv_repo = ConversationRepository(session)
+    msg_repo = MessageRepository(session)
+    audit_repo = AuditLogRepository(session)
+    risk_repo = RiskFlagRepository(session)
+
     external_message_id = payload.get("external_message_id")
-    raw = WebhookRawEvent(
+
+    raw = raw_repo.create(
         channel=channel,
         external_message_id=external_message_id,
         verified=verified,
-        accepted=False,
         payload=payload,
     )
-    session.add(raw)
-    session.commit()
-    session.refresh(raw)
 
     if not verified:
         raw.rejection_reason = "invalid_signature"
-        session.add(raw)
-        session.commit()
+        raw_repo.save(raw)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook signature")
 
     # Deduplicate by (channel, external_message_id)
-    existing = session.exec(
-        select(ExternalMessageRef).where(
-            ExternalMessageRef.channel == channel,
-            ExternalMessageRef.external_message_id == external_message_id,
-        )
-    ).first()
+    existing = ext_ref_repo.find_by_channel_and_external_id(channel, external_message_id)
     if existing:
         raw.accepted = True
         raw.deduplicated = True
-        session.add(raw)
-        session.commit()
+        raw_repo.save(raw)
         return {
             "accepted": True,
             "deduplicated": True,
@@ -273,109 +287,86 @@ def ingest_webhook_message(
         }
 
     external_sender_id = payload["external_sender_id"]
-    identity = session.exec(
-        select(KOCIdentity).where(
-            KOCIdentity.channel == channel,
-            KOCIdentity.external_sender_id == external_sender_id,
-        )
-    ).first()
+    identity = koc_identity_repo.find_by_channel_and_sender(channel, external_sender_id)
     if identity:
         koc_id = identity.koc_id
     else:
         # Create placeholder KOC + identity mapping
         display = payload.get("koc_display_name") or f"{channel}:{external_sender_id}"
-        koc = KOC(display_name=display)
-        session.add(koc)
-        session.commit()
-        session.refresh(koc)
-
-        identity = KOCIdentity(channel=channel, external_sender_id=external_sender_id, koc_id=koc.id)
-        session.add(identity)
-        session.commit()
+        koc = koc_repo.create(display_name=display)
+        koc_identity_repo.create(
+            channel=channel,
+            external_sender_id=external_sender_id,
+            koc_id=koc.id,
+        )
         koc_id = koc.id
 
     campaign_id = UUID(str(payload["campaign_id"]))
     assigned_booker_id = payload["assigned_booker_id"]
-    assigned = session.get(User, assigned_booker_id)
+
+    assigned = user_repo.get_by_id(assigned_booker_id)
     if not assigned or assigned.role != Role.booker:
         raw.rejection_reason = "invalid_assigned_booker"
-        session.add(raw)
-        session.commit()
+        raw_repo.save(raw)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid assigned_booker_id")
 
     # Find an existing non-closed conversation for that koc+campaign+booker, else create.
-    conv = session.exec(
-        select(Conversation)
-        .where(
-            Conversation.koc_id == koc_id,
-            Conversation.campaign_id == campaign_id,
-            Conversation.assigned_booker_id == assigned_booker_id,
-            Conversation.status != ConversationStatus.closed,
-        )
-        .order_by(col(Conversation.created_at).desc())
-    ).first()
-    # Atomic write for accepted event: conversation (optional) + message + external ref + audit + risk + raw.accepted
+    conv = conv_repo.find_open_for_koc_campaign_booker(koc_id, campaign_id, assigned_booker_id)
+
+    # Atomic write: conversation (optional) + message + external ref + audit + risk + raw.accepted
     try:
         if not conv:
-            if not session.get(Campaign, campaign_id):
+            if not campaign_repo.get_by_id(campaign_id):
                 raw.rejection_reason = "campaign_not_found"
-                session.add(raw)
-                session.commit()
+                raw_repo.save(raw)
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
-            conv = Conversation(
+            conv = conv_repo.create(
                 koc_id=koc_id,
                 campaign_id=campaign_id,
                 assigned_booker_id=assigned_booker_id,
                 team_id=assigned.team_id,
-                status=ConversationStatus.open,
+                flush_only=True,
             )
-            session.add(conv)
-            session.flush()
 
-        msg = Message(conversation_id=conv.id, sender_user_id=None, body=payload["text"])
-        session.add(msg)
-        session.flush()
-
-        session.add(
-            ExternalMessageRef(
-                channel=channel,
-                external_message_id=external_message_id,
-                conversation_id=conv.id,
-                message_id=msg.id,
-            )
+        msg = msg_repo.create_with_flush(
+            conversation_id=conv.id,
+            sender_user_id=None,
+            body=payload["text"],
         )
 
-        session.add(
-            AuditLog(
-                actor_user_id="system",
-                conversation_id=conv.id,
-                event_type=AuditEventType.message_added,
-                payload={
-                    "message_id": str(msg.id),
-                    "koc_id": str(conv.koc_id),
-                    "campaign_id": str(conv.campaign_id),
-                    "channel": channel,
-                    "external_message_id": external_message_id,
-                },
-            )
+        ext_ref_repo.create(
+            channel=channel,
+            external_message_id=external_message_id,
+            conversation_id=conv.id,
+            message_id=msg.id,
+        )
+
+        audit_repo.create(
+            actor_user_id="system",
+            conversation_id=conv.id,
+            event_type=AuditEventType.message_added,
+            payload={
+                "message_id": str(msg.id),
+                "koc_id": str(conv.koc_id),
+                "campaign_id": str(conv.campaign_id),
+                "channel": channel,
+                "external_message_id": external_message_id,
+            },
         )
 
         kws = _detect_sensitive_keywords(payload["text"])
         if kws:
-            session.add(
-                RiskFlag(
-                    conversation_id=conv.id,
-                    message_id=msg.id,
-                    risk_type="sensitive_keyword",
-                    severity=RiskSeverity.high,
-                    reason=f"Sensitive keyword detected: {', '.join(kws)}",
-                    payload={"keywords": kws, "channel": channel, "external_message_id": external_message_id},
-                )
+            risk_repo.create(
+                conversation_id=conv.id,
+                message_id=msg.id,
+                risk_type="sensitive_keyword",
+                severity=RiskSeverity.high,
+                reason=f"Sensitive keyword detected: {', '.join(kws)}",
+                payload={"keywords": kws, "channel": channel, "external_message_id": external_message_id},
             )
 
         raw.accepted = True
-        session.add(raw)
-        session.commit()
+        raw_repo.save(raw)
     except Exception:
         session.rollback()
         raise
@@ -387,16 +378,6 @@ def ingest_webhook_message(
         "message_id": msg.id,
         "raw_event_id": raw.id,
     }
-
-
-def list_risk_flags(*, session: Session, user: User, conversation_id: UUID) -> list[RiskFlag]:
-    conv = session.get(Conversation, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    ensure_conversation_access(user=user, conv=conv)
-    stmt = select(RiskFlag).where(RiskFlag.conversation_id == conversation_id).order_by(col(RiskFlag.created_at).asc())
-    return list(session.exec(stmt).all())
-
 
 MONEY_KEYWORDS = [
     "commission riêng",
@@ -412,7 +393,6 @@ MONEY_KEYWORDS = [
     "ck",
 ]
 
-
 COMMIT_KEYWORDS = [
     "chốt",
     "ok deal",
@@ -420,7 +400,6 @@ COMMIT_KEYWORDS = [
     "đồng ý chốt",
     "commit",
 ]
-
 
 KOC_CONFIRM_KEYWORDS = [
     "ok",
@@ -436,7 +415,6 @@ def _contains_any(text: str, keywords: list[str]) -> list[str]:
 
 
 def _has_price_evidence(messages: list[Message]) -> bool:
-    # MVP heuristic: any message that contains "giá"/"price"/currency-like tokens indicates discussion.
     evidence_tokens = ["giá", "price", "vnd", "usd", "triệu", "tr", "k", "%"]
     for m in messages:
         if _contains_any(m.body, evidence_tokens):
@@ -467,26 +445,21 @@ def evaluate_conversation_risks(*, session: Session, conversation_id: UUID) -> l
     Recompute risk flags for a conversation (MVP).
     Implementation: remove prior auto rule flags, then insert current ones.
     """
-    conv = session.get(Conversation, conversation_id)
+    conv_repo = ConversationRepository(session)
+    deal_repo = DealRepository(session)
+    msg_repo = MessageRepository(session)
+    risk_repo = RiskFlagRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
-    deal = session.exec(select(Deal).where(Deal.conversation_id == conversation_id)).first()
-    msgs = list(
-        session.exec(
-            select(Message).where(Message.conversation_id == conversation_id).order_by(col(Message.created_at).asc())
-        ).all()
-    )
+    deal = deal_repo.get_by_conversation(conversation_id)
+    msgs = msg_repo.list_by_conversation(conversation_id)
 
     # Delete prior auto flags for idempotency
-    old_flags = session.exec(
-        select(RiskFlag).where(
-            RiskFlag.conversation_id == conversation_id,
-            col(RiskFlag.risk_type).like(f"{AUTO_RULE_PREFIX}%"),
-        )
-    ).all()
-    for f in old_flags:
-        session.delete(f)
+    old_flags = risk_repo.list_auto_flags(conversation_id, AUTO_RULE_PREFIX)
+    risk_repo.delete_all(old_flags)
     session.commit()
 
     new_flags: list[RiskFlag] = []
@@ -562,37 +535,34 @@ def evaluate_conversation_risks(*, session: Session, conversation_id: UUID) -> l
                         risk_type="rule_commit_before_approval_request",
                         severity=RiskSeverity.high,
                         reason="Commitment message was sent before approval was requested",
-                        payload={"committed_at": committed_at.isoformat(), "approval_requested_at": deal.approval_requested_at.isoformat()},
+                        payload={
+                            "committed_at": committed_at.isoformat(),
+                            "approval_requested_at": deal.approval_requested_at.isoformat(),
+                        },
                     )
                 )
 
-    session.add_all(new_flags)
+    risk_repo.create_all(new_flags)
     session.commit()
 
     # Return current flags (auto + manual)
-    return list(
-        session.exec(
-            select(RiskFlag).where(RiskFlag.conversation_id == conversation_id).order_by(col(RiskFlag.created_at).asc())
-        ).all()
-    )
-
+    return risk_repo.list_by_conversation(conversation_id)
 
 def upsert_deal(*, session: Session, actor: User, conversation_id: UUID, data: dict) -> Deal:
-    conv = session.get(Conversation, conversation_id)
+    conv_repo = ConversationRepository(session)
+    deal_repo = DealRepository(session)
+
+    conv = conv_repo.get_by_id(conversation_id)
     if not conv:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
     ensure_conversation_access(user=actor, conv=conv)
 
-    deal = session.exec(select(Deal).where(Deal.conversation_id == conversation_id)).first()
+    deal = deal_repo.get_by_conversation(conversation_id)
     if not deal:
         deal = Deal(conversation_id=conversation_id)
-        session.add(deal)
 
     for k, v in data.items():
         setattr(deal, k, v)
     deal.updated_at = now_utc()
-    session.add(deal)
-    session.commit()
-    session.refresh(deal)
-    return deal
 
+    return deal_repo.save(deal)

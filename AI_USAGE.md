@@ -1,4 +1,4 @@
-# Omni-channel Chat CRM system design
+# Coding Agent: Cursor
 
 **User**
 
