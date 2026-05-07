@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Persist sqlite to a mounted volume inside container
+      - CRMCHAT_DB_URL=sqlite:////data/crmchat.db
+    volumes:
+      - crmchat_data:/data
+
+volumes:
+  crmchat_data:
