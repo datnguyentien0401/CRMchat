@@ -54,7 +54,7 @@ Trong CRMchat, các chức năng “tương đương” được tách ra thành
 - **Hiện có**:
   - `app/main.py`: router/controller layer (FastAPI endpoints)
   - `app/service.py`: service layer (business rules + DB writes/reads)
-  - repository/DAO layer riêng (DB query hiện ở `service.py`)
+  - `app/repository.py` repository/DAO layer riêng
 
 ### 4.2 Lấy user từ auth context (không tin `bookerId` từ body)
 
